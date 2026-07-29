@@ -1251,3 +1251,1100 @@ if( xHandle != NULL )
 
 ### 14. *xQueueCreateCountingSemaphore*
 
+`xQueueCreateCountingSemaphore` 是 FreeRTOS 中用於**動態配置記憶體**並建立「計數信號量」（Counting Semaphore）的核心 API。
+
+核心概念與與靜態版的差異：
+
+- **計數信號量 (Counting Semaphore)**：主要用於**資源管理**（多個相同的硬體或軟體資源）與**事件計數**（統計中斷或事件發生的次數）。
+    
+- **動態配置 (Dynamic Allocation)**：與 `xQueueCreateCountingSemaphoreStatic`（靜態版）不同，此 API 會在執行時期自動向 FreeRTOS 堆疊（Heap，即 `pvPortMalloc`）申請所需的 `Queue_t` 控制結構體記憶體。開發者無需手動宣告與管理 `StaticQueue_t` 變數。
+
+動態 vs 靜態建立計數信號量比較
+
+|**特性**|**動態版本 (xQueueCreateCountingSemaphore)**|**靜態版本 (xQueueCreateCountingSemaphoreStatic)**|
+|---|---|---|
+|**記憶體來源**|FreeRTOS Heap (`pvPortMalloc`)|開發者預先宣告的 `StaticQueue_t`|
+|**額外參數**|無|需要傳入 `StaticQueue_t *pxStaticQueue`|
+|**記憶體釋放**|使用完畢需呼叫 `vSemaphoreDelete()` 來 `vPortFree`|結構體記憶體由程式管理者手動回收（例如全域變數不需回收）|
+|**適用場景**|靈活、專案允許動態分配記憶體|記憶體受限、不允許碎片化、高安全性（航太/醫療）專案|
+
+### 15. *xQueueGenericSend*
+
+`xQueueGenericSend` 是 FreeRTOS 中**最核心的佇列發送 API**。基本上，常見的 `xQueueSend()`、`xQueueSendToBack()`、`xQueueSendToFront()` 以及 `xQueueOverwrite()` 等巨集，底層都是呼叫這個通用函數。
+
+它負責處理：
+
+1. **資料複製**（FIFO / LIFO / Overwrite 覆寫模式）。
+    
+2. **喚醒等待接收資料的任務**（與優先級搶占）。
+    
+3. **Queue Set（佇列集）的通知**。
+    
+4. **佇列已滿時的任務阻塞（Blocked）與超時（Timeout）機制**。
+
+#### 15.1 函數簽名與變數宣告
+
+```C
+BaseType_t xQueueGenericSend( QueueHandle_t xQueue,
+                              const void * const pvItemToQueue,
+                              TickType_t xTicksToWait,
+                              const BaseType_t xCopyPosition )
+{
+    BaseType_t xEntryTimeSet = pdFALSE, xYieldRequired;
+    TimeOut_t xTimeOut;
+    Queue_t * const pxQueue = xQueue;
+```
+
+**說明：**
+
+- **參數說明**：
+    
+    - `xQueue`：佇列句柄。
+        
+    - `pvItemToQueue`：要寫入的資料指標（若是 Semaphore 則為 NULL）。
+        
+    - `xTicksToWait`：若佇列滿了，願意等待（Blocked）的最大 Tick 數。
+        
+    - `xCopyPosition`：寫入位置，可為 `queueSEND_TO_BACK` (FIFO)、`queueSEND_TO_FRONT` (LIFO) 或 `queueOVERWRITE` (覆寫)。
+        
+- **區域變數**：
+    
+    - `xEntryTimeSet`：標記是否已記錄任務進入等待超時的起始時間。
+        
+    - `xTimeOut`：記錄超時狀態的結構體。
+
+#### 15.2 安全斷言與參數檢驗 (Assertions)
+
+```C
+traceENTER_xQueueGenericSend( xQueue, pvItemToQueue, xTicksToWait, xCopyPosition );
+
+    configASSERT( pxQueue );
+    configASSERT( !( ( pvItemToQueue == NULL ) && ( pxQueue->uxItemSize != ( UBaseType_t ) 0U ) ) );
+    configASSERT( !( ( xCopyPosition == queueOVERWRITE ) && ( pxQueue->uxLength != 1 ) ) );
+    #if ( ( INCLUDE_xTaskGetSchedulerState == 1 ) || ( configUSE_TIMERS == 1 ) )
+    {
+        configASSERT( !( ( xTaskGetSchedulerState() == taskSCHEDULER_SUSPENDED ) && ( xTicksToWait != 0 ) ) );
+    }
+    #endif
+```
+
+**說明：**
+
+- **`configASSERT` 檢查**：
+    
+    1. `pxQueue` 不能為 NULL。
+        
+    2. 若 `uxItemSize != 0`（資料長度大於 0），傳入的資料指標 `pvItemToQueue` 不能為 NULL。
+        
+    3. 若指定 `queueOVERWRITE`（覆寫模式），佇列長度 **必須為 1**（Mailbox 模式）。
+        
+    4. 若排程器目前被鎖定/暫停（Suspended），則 **允許的等待時間 `xTicksToWait` 必須為 0**（否則系統無法切換任務，會導致死鎖）。
+
+#### 15.3 嘗試寫入：空間足夠時的處理 (以無 Queue Sets 為例)
+
+```C
+for( ; ; )
+    {
+        taskENTER_CRITICAL();
+        {
+            if( ( pxQueue->uxMessagesWaiting < pxQueue->uxLength ) || ( xCopyPosition == queueOVERWRITE ) )
+            {
+                traceQUEUE_SEND( pxQueue );
+
+                #else /* configUSE_QUEUE_SETS */
+                {
+                    xYieldRequired = prvCopyDataToQueue( pxQueue, pvItemToQueue, xCopyPosition );
+
+                    /* If there was a task waiting for data to arrive on the
+                     * queue then unblock it now. */
+                    if( listLIST_IS_EMPTY( &( pxQueue->xTasksWaitingToReceive ) ) == pdFALSE )
+                    {
+                        if( xTaskRemoveFromEventList( &( pxQueue->xTasksWaitingToReceive ) ) != pdFALSE )
+                        {
+                            queueYIELD_IF_USING_PREEMPTION();
+                        }
+                        else
+                        {
+                            mtCOVERAGE_TEST_MARKER();
+                        }
+                    }
+                    else if( xYieldRequired != pdFALSE )
+                    {
+                        queueYIELD_IF_USING_PREEMPTION();
+                    }
+                    else
+                    {
+                        mtCOVERAGE_TEST_MARKER();
+                    }
+                }
+                #endif /* configUSE_QUEUE_SETS */
+
+                taskEXIT_CRITICAL();
+
+                traceRETURN_xQueueGenericSend( pdPASS );
+
+                return pdPASS;
+            }
+```
+
+**說明：**
+
+- 進入臨界區 (`taskENTER_CRITICAL`) 保護數據結構。
+    
+- **判斷可寫入條件**：當前佇列未滿（`uxMessagesWaiting < uxLength`）或使用的是「覆寫模式」。
+    
+- **`prvCopyDataToQueue()`**：將資料複製到 Queue 的記憶體緩衝區（根據 `xCopyPosition` 決定放佇列頭還是佇列尾，並增加 `uxMessagesWaiting` 計數）。
+    
+- **喚醒等待接收的任務**：
+    
+    - 檢查是否有其他任務正因為等待此佇列的資料而處於阻塞狀態 (`xTasksWaitingToReceive` 非空)。
+        
+    - 透過 `xTaskRemoveFromEventList()` 將該任務從事件等待清單移回 Ready List。
+        
+    - 若被喚醒的任務優先級**高於當前任務**，呼叫 `queueYIELD_IF_USING_PREEMPTION()` 觸發上下文切換（Context Switch）。
+        
+- 成功回傳 `pdPASS`。
+
+#### 15.4 啟用 Queue Sets 時的特化寫入處理 (如果啟用 `configUSE_QUEUE_SETS`)
+
+```C
+#if ( configUSE_QUEUE_SETS == 1 )
+                {
+                    const UBaseType_t uxPreviousMessagesWaiting = pxQueue->uxMessagesWaiting;
+
+                    xYieldRequired = prvCopyDataToQueue( pxQueue, pvItemToQueue, xCopyPosition );
+
+                    if( pxQueue->pxQueueSetContainer != NULL )
+                    {
+                        if( ( xCopyPosition == queueOVERWRITE ) && ( uxPreviousMessagesWaiting != ( UBaseType_t ) 0 ) )
+                        {
+                            /* 覆寫舊資料時數量未增加，不通知 Queue Set */
+                            mtCOVERAGE_TEST_MARKER();
+                        }
+                        else if( prvNotifyQueueSetContainer( pxQueue ) != pdFALSE )
+                        {
+                            /* 通知 Queue Set，若喚醒了更優先任務則觸發任務切換 */
+                            queueYIELD_IF_USING_PREEMPTION();
+                        }
+                        else
+                        {
+                            mtCOVERAGE_TEST_MARKER();
+                        }
+                    }
+                    else
+                    {
+                        /* 此 Queue 不屬於 Queue Set，走一般喚醒邏輯... */
+                    }
+                }
+```
+
+**說明：**
+
+- **Queue Sets（佇列集）** 允許一個任務同時監聽多個佇列。
+    
+- 若此 Queue 屬於某個 Queue Set，且這是一個新增資料動作（非覆寫舊資料），會呼叫 `prvNotifyQueueSetContainer` 向 Queue Set 發送通知。
+
+#### 15.5 佇列已滿：檢查 Block Time 與 初始化 Timeout
+
+```C
+else
+            {
+                if( xTicksToWait == ( TickType_t ) 0 )
+                {
+                    /* Queue 已滿且不打算等待，離開臨界區並回傳佇列已滿 */
+                    taskEXIT_CRITICAL();
+
+                    traceQUEUE_SEND_FAILED( pxQueue );
+                    traceRETURN_xQueueGenericSend( errQUEUE_FULL );
+
+                    return errQUEUE_FULL;
+                }
+                else if( xEntryTimeSet == pdFALSE )
+                {
+                    /* 第一次發現佇列已滿且指定了等待時間，初始化 Timeout 結構 */
+                    vTaskInternalSetTimeOutState( &xTimeOut );
+                    xEntryTimeSet = pdTRUE;
+                }
+                else
+                {
+                    mtCOVERAGE_TEST_MARKER();
+                }
+            }
+        }
+        taskEXIT_CRITICAL();
+```
+
+**說明：**
+
+- 當佇列已滿時：
+    
+    1. 若 `xTicksToWait == 0`：不等待，直接退出臨界區並回傳 `errQUEUE_FULL`。
+        
+    2. 若 `xTicksToWait > 0` 且是第一次嘗試：呼叫 `vTaskInternalSetTimeOutState()` 記錄進入等待時的 TickCount，準備後續追蹤超時狀態。
+
+#### 15.6 鎖定佇列並進入阻塞等待 (Blocking)
+
+```C
+vTaskSuspendAll();
+        prvLockQueue( pxQueue );
+
+        /* 更新並檢查超時狀態 */
+        if( xTaskCheckForTimeOut( &xTimeOut, &xTicksToWait ) == pdFALSE )
+        {
+            if( prvIsQueueFull( pxQueue ) != pdFALSE )
+            {
+                traceBLOCKING_ON_QUEUE_SEND( pxQueue );
+                vTaskPlaceOnEventList( &( pxQueue->xTasksWaitingToSend ), xTicksToWait );
+
+                prvUnlockQueue( pxQueue );
+
+                if( xTaskResumeAll() == pdFALSE )
+                {
+                    taskYIELD_WITHIN_API();
+                }
+            }
+            else
+            {
+                /* 解鎖佇列，進入下一次 for 迴圈重新嘗試發送 */
+                prvUnlockQueue( pxQueue );
+                ( void ) xTaskResumeAll();
+            }
+        }
+```
+
+**說明：**
+
+- **雙重保護設計**：
+    
+    - `vTaskSuspendAll()`：暫停排程器，確保排程器不會切換任務，但允許中斷（ISR）運作。
+        
+    - `prvLockQueue()`：鎖定佇列，防止中斷（ISR）修改 `xTasksWaitingToSend` 等列表。
+        
+- **`xTaskCheckForTimeOut()`**：計算時間是否已逾時（此 API 會自動更新剩餘的 `xTicksToWait`）。
+    
+- **未逾時且佇列依然是滿的**：
+    
+    - 呼叫 `vTaskPlaceOnEventList()` 將當前任務放入 `xTasksWaitingToSend` 列表，並掛起進入 **Blocked** 狀態。
+        
+    - `prvUnlockQueue()` 與 `xTaskResumeAll()` 解除鎖定與恢復排程器。
+        
+    - 呼叫 `taskYIELD_WITHIN_API()` 讓出 CPU，觸發上下文切換。
+
+#### 15.7 超時處理 (Timeout Expired)
+
+```C
+else
+        {
+            /* 超時時間已到 */
+            prvUnlockQueue( pxQueue );
+            ( void ) xTaskResumeAll();
+
+            traceQUEUE_SEND_FAILED( pxQueue );
+            traceRETURN_xQueueGenericSend( errQUEUE_FULL );
+
+            return errQUEUE_FULL;
+        }
+    }
+}
+```
+
+**說明：**
+
+- 若 `xTaskCheckForTimeOut` 回傳 `pdTRUE`，代表任務在阻塞狀態中等待了足夠長的時間，但佇列依然沒有空出位置。
+    
+- 解鎖 Queue 與 Resume 排程器後，回傳 `errQUEUE_FULL`。
+
+#### 15.8 為什麼需要 `xEntryTimeSet`？
+
+`xEntryTimeSet` 是一個**狀態標記（Flag）**，它的核心作用是：**確保任務在等待 Queue 空出位置時，只會在「第一次進入」時記錄起始時間，防止超時倒數（Timeout）被重置。**
+
+簡而言之，它是用來防止「計時器無限重置」的關鍵機制。
+
+在 `xQueueGenericSend` 中，整個發送流程包在一個 `for( ; ; )` 無窮迴圈裡。這是因為任務在等待 Queue 時，可能會遇到「搶鎖競爭」：
+
+1. **Task A** 發送資料發現 Queue 滿了，進入 Block 狀態等待。
+    
+2. 有人讀走了 Queue 中的資料，**Task A 被喚醒**。
+    
+3. 但在 Task A 準備寫入前的一瞬間，一個優先級更高的 **Task B 突然插隊** 把剛空出來的位置搶走了！
+    
+4. **Task A 再次發現 Queue 滿了**，必須重新回到 `for( ; ; )` 迴圈開頭再次等待。
+
+如果沒有 `xEntryTimeSet` 會發生什麼事？
+
+假設你呼叫 API 時設定「最多等待 **100 個 Tick**」(`xTicksToWait = 100`)：
+
+- **沒有 `xEntryTimeSet` 的情況：** 每次被插隊並重新回到迴圈時，系統都會呼叫 `vTaskInternalSetTimeOutState(&xTimeOut)` **重置起跑線**。如果 Task A 被插隊 3 次，原本總共只想等 100 Ticks 的 Task A，最後可能會苦苦等待 300 Ticks 以上才超時，這嚴重違背了即時作業系統（RTOS）的預期！
+    
+- **有 `xEntryTimeSet` 的情況：**
+    
+    - **第一次發現 Queue 滿了（`xEntryTimeSet == pdFALSE`）：** 系統呼叫 `vTaskInternalSetTimeOutState(&xTimeOut)` 蓋章記錄**初始時間點（起跑線）**，並將 `xEntryTimeSet` 設為 **`pdTRUE`**。
+        
+    - **第二次以後發現 Queue 又滿了（`xEntryTimeSet == pdTRUE`）：** 跳過記錄起跑線的步驟！維持最初的起跑點不變。
+### 16. *xQueueGenericSendFromISR*
+
+`xQueueGenericSendFromISR` 是 FreeRTOS 中專門提供給中斷服務程式（ISR, Interrupt Service Routine）使用的佇列發送 API。
+
+它與任務層級（Task-level）的 `xQueueGenericSend` 主要有三點關鍵差異：
+
+1. **絕不阻塞（Non-blocking）**：中斷處理程序必須盡快執行完畢，無法進入等待狀態；若佇列已滿會立即回傳 `errQUEUE_FULL`。
+    
+2. **中斷安全的臨界區**：使用 `taskENTER_CRITICAL_FROM_ISR()` / `taskEXIT_CRITICAL_FROM_ISR()` 來確保在中斷嵌入環境下的原子性操作。
+    
+3. **延遲任務切換（Context Switch）**：中斷中無法直接觸發任務切換，而是透過 `pxHigherPriorityTaskWoken` 參數告知呼叫者「是否喚醒了更高優先級的任務」，由開發者在中斷結束前手動呼叫 `portYIELD_FROM_ISR()`。
+
+#### 16.1 函數簽名與參數檢查
+
+```C
+BaseType_t xQueueGenericSendFromISR( QueueHandle_t xQueue,
+                                     const void * const pvItemToQueue,
+                                     BaseType_t * const pxHigherPriorityTaskWoken,
+                                     const BaseType_t xCopyPosition )
+{
+    BaseType_t xReturn;
+    UBaseType_t uxSavedInterruptStatus;
+    Queue_t * const pxQueue = xQueue;
+
+    traceENTER_xQueueGenericSendFromISR( xQueue, pvItemToQueue, pxHigherPriorityTaskWoken, xCopyPosition );
+
+    configASSERT( ( pxQueue != NULL ) && !( ( pvItemToQueue == NULL ) && ( pxQueue->uxItemSize != ( UBaseType_t ) 0U ) ) );
+    configASSERT( ( pxQueue != NULL ) && !( ( xCopyPosition == queueOVERWRITE ) && ( pxQueue->uxLength != 1 ) ) );
+```
+
+**解析：**
+
+- **`xQueue`**：欲寫入的 Queue 句柄。
+    
+- **`pvItemToQueue`**：待傳送資料的記憶體位址。
+    
+- **`pxHigherPriorityTaskWoken`**：輸出指標。若此次寫入喚醒了優先級比目前被中斷任務更高的任務，會被改寫為 `pdTRUE`。
+    
+- **`xCopyPosition`**：指定資料填入的位置（`queueSEND_TO_BACK`、`queueSEND_TO_FRONT` 或 `queueOVERWRITE`）。
+    
+- **`uxSavedInterruptStatus`**：用於保存進入中斷臨界區前的硬體中斷開關狀態暫存器。
+    
+- **`traceENTER_...`**：系統追蹤工具（如 Percepio Tracealyzer）的進入點記錄巨集。
+
+#### 16.2 中斷優先級硬體防錯機制
+
+```C
+portASSERT_IF_INTERRUPT_PRIORITY_INVALID();
+```
+
+> **解析：**
+> 
+> - **第一個 `configASSERT`**：防呆檢查，確保 `pxQueue` 指針有效；且當 `uxItemSize != 0` 時，資料指針 `pvItemToQueue` 不得為 `NULL`。
+>     
+> - **第二個 `configASSERT`**：確保只有在佇列長度為 1（Mailbox 模式）時，才允許使用 `queueOVERWRITE` 覆寫模式。
+>     
+> - **`portASSERT_IF_INTERRUPT_PRIORITY_INVALID()`**：在 ARM Cortex-M 等支持中斷嵌套的架構中，確認**呼叫此 API 的硬體中斷優先級，是否低於或等於 `configMAX_SYSCALL_INTERRUPT_PRIORITY`**。若中斷優先級過高，呼叫 FreeRTOS API 會直接觸發 Assert 失敗，防止破壞核心數據結構。
+
+
+#### 16.3 進入中斷臨界區與資料複製
+
+```C
+uxSavedInterruptStatus = ( UBaseType_t ) taskENTER_CRITICAL_FROM_ISR();
+    {
+        if( ( pxQueue->uxMessagesWaiting < pxQueue->uxLength ) || ( xCopyPosition == queueOVERWRITE ) )
+        {
+            const int8_t cTxLock = pxQueue->cTxLock;
+            const UBaseType_t uxPreviousMessagesWaiting = pxQueue->uxMessagesWaiting;
+
+            traceQUEUE_SEND_FROM_ISR( pxQueue );
+
+            ( void ) prvCopyDataToQueue( pxQueue, pvItemToQueue, xCopyPosition );
+```
+
+**解析：**
+
+- **`taskENTER_CRITICAL_FROM_ISR()`**：屏蔽 `configMAX_SYSCALL_INTERRUPT_PRIORITY` 以下的中斷，確保原子性操作，並回傳原先的中斷狀態。
+    
+- **`if(...)` 空間判斷**：只有當 Queue 尚有空位（`uxMessagesWaiting < uxLength`），或者採用 `queueOVERWRITE` 覆寫模式時，才會進行寫入。
+    
+- **`cTxLock` 與 `uxPreviousMessagesWaiting`**：備份當前 Queue 的發送鎖（TxLock）狀態與原有的訊息數量。
+    
+- **`prvCopyDataToQueue(...)`**：將 `pvItemToQueue` 的資料複製到 Queue 內部緩衝區，並增加計數值 `uxMessagesWaiting`。
+
+#### 16.4 當 Queue 未被鎖定 (`cTxLock == queueUNLOCKED`) 且開啟 Queue Sets (`configUSE_QUEUE_SETS == 1`)
+
+```C
+if( cTxLock == queueUNLOCKED )
+            {
+                #if ( configUSE_QUEUE_SETS == 1 )
+                {
+                    if( pxQueue->pxQueueSetContainer != NULL )
+                    {
+                        if( ( xCopyPosition == queueOVERWRITE ) && ( uxPreviousMessagesWaiting != ( UBaseType_t ) 0 ) )
+                        {
+                            /* Do not notify the queue set as an existing item
+                             * was overwritten in the queue so the number of items
+                             * in the queue has not changed. */
+                            mtCOVERAGE_TEST_MARKER();
+                        }
+                        else if( prvNotifyQueueSetContainer( pxQueue ) != pdFALSE )
+                        {
+                            if( pxHigherPriorityTaskWoken != NULL )
+                            {
+                                *pxHigherPriorityTaskWoken = pdTRUE;
+                            }
+                            else
+                            {
+                                mtCOVERAGE_TEST_MARKER();
+                            }
+                        }
+                        else
+                        {
+                            mtCOVERAGE_TEST_MARKER();
+                        }
+                    }
+                    else
+                    {
+                        if( listLIST_IS_EMPTY( &( pxQueue->xTasksWaitingToReceive ) ) == pdFALSE )
+                        {
+                            if( xTaskRemoveFromEventList( &( pxQueue->xTasksWaitingToReceive ) ) != pdFALSE )
+                            {
+                                if( pxHigherPriorityTaskWoken != NULL )
+                                {
+                                    *pxHigherPriorityTaskWoken = pdTRUE;
+                                }
+                                else
+                                {
+                                    mtCOVERAGE_TEST_MARKER();
+                                }
+                            }
+                            else
+                            {
+                                mtCOVERAGE_TEST_MARKER();
+                            }
+                        }
+                        else
+                        {
+                            mtCOVERAGE_TEST_MARKER();
+                        }
+                    }
+                }
+```
+
+**解析：**
+
+- **`pxQueueSetContainer != NULL`（隸屬於 Queue Set）**：
+    
+    - 若使用 `queueOVERWRITE` 且原先已有資料 (`uxPreviousMessagesWaiting != 0`)，由於項目數量未變，不通知 Queue Set Container，執行 `mtCOVERAGE_TEST_MARKER()`。
+        
+    - 否則呼叫 **`prvNotifyQueueSetContainer(pxQueue)`**，將當前 Queue 句柄寫入 Queue Set。若喚醒了等待 Queue Set 的更高優先級任務，且 `pxHigherPriorityTaskWoken` 非空，將 `*pxHigherPriorityTaskWoken` 設為 **`pdTRUE`**。
+        
+- **`pxQueueSetContainer == NULL`（不隸屬 Queue Set）**：
+    
+    - 檢查是否有 Task 正在等待接收此 Queue (`xTasksWaitingToReceive` 非空)。
+        
+    - 透過 **`xTaskRemoveFromEventList()`** 將等待清單中最高優先級的 Task 移動至 Ready List。
+        
+    - 若該 Task 優先級高於當前被中斷打斷的 Task（`xTaskRemoveFromEventList` 回傳 `pdTRUE`），將 `*pxHigherPriorityTaskWoken` 設為 **`pdTRUE`**。
+
+#### 16.5 當 Queue 未被鎖定 (`cTxLock == queueUNLOCKED`) 且關閉 Queue Sets (`configUSE_QUEUE_SETS == 0`)
+
+```C
+#else /* configUSE_QUEUE_SETS */
+                {
+                    if( listLIST_IS_EMPTY( &( pxQueue->xTasksWaitingToReceive ) ) == pdFALSE )
+                    {
+                        if( xTaskRemoveFromEventList( &( pxQueue->xTasksWaitingToReceive ) ) != pdFALSE )
+                        {
+                            /* The task waiting has a higher priority so record that a
+                             * context switch is required. */
+                            if( pxHigherPriorityTaskWoken != NULL )
+                            {
+                                *pxHigherPriorityTaskWoken = pdTRUE;
+                            }
+                            else
+                            {
+                                mtCOVERAGE_TEST_MARKER();
+                            }
+                        }
+                        else
+                        {
+                            mtCOVERAGE_TEST_MARKER();
+                        }
+                    }
+                    else
+                    {
+                        mtCOVERAGE_TEST_MARKER();
+                    }
+
+                    /* Not used in this path. */
+                    ( void ) uxPreviousMessagesWaiting;
+                }
+                #endif /* configUSE_QUEUE_SETS */
+            }
+```
+
+**解析：**
+
+- 此為**未啟用 Queue Sets** 時的標準發送邏輯：
+    
+    - 判斷 `xTasksWaitingToReceive` 鏈結串列是否非空。
+        
+    - **非空**：呼叫 `xTaskRemoveFromEventList` 解除一個等待 Task 的阻塞狀態。若該 Task 優先級較高，且傳入的 `pxHigherPriorityTaskWoken` 非空，則將其指向的值設為 `pdTRUE`；若指標為 `NULL` 則觸發測試標記 `mtCOVERAGE_TEST_MARKER()`。
+        
+    - **為空**：無等待 Task，直接執行 `mtCOVERAGE_TEST_MARKER()`。
+        
+    - **`(void) uxPreviousMessagesWaiting;`**：避免編譯器產生 "unused variable" 警告。
+
+#### 16.6 當 Queue 處於鎖定狀態 (`cTxLock != queueUNLOCKED`)
+
+```C
+else
+            {
+                /* Increment the lock count so the task that unlocks the queue
+                 * knows that data was posted while it was locked. */
+                prvIncrementQueueTxLock( pxQueue, cTxLock );
+            }
+
+            xReturn = pdPASS;
+        }
+```
+
+> **解析：**
+> 
+> - **`cTxLock != queueUNLOCKED` 的意義**：代表某個 Task 目前正處於佇列操作中，並透過 `prvLockQueue()` 暫時鎖定了此 Queue。
+>     
+> - **鎖定時的防護**：為了避免 ISR 與該 Task 同時修改 `xTasksWaitingToReceive` 事件鏈結串列造成競態條件（Race Condition），ISR **此時絕不手動修改事件串列**。
+>     
+> - **處理機制**：呼叫 **`prvIncrementQueueTxLock(pxQueue, cTxLock)`** 將寫入鎖計數器 `cTxLock` 加 1。待持有鎖的 Task 稍後執行 `prvUnlockQueue()` 時，會檢視此計數器並補做「將等待 Task 移出事件鏈結串列」的動作。
+>     
+> - 寫入完成，將 `xReturn` 標記為 **`pdPASS`**。
+
+#### 16.7 Queue 已滿處理、退出臨界區與回傳
+
+```C
+else
+        {
+            traceQUEUE_SEND_FAILED( pxQueue );
+            xReturn = errQUEUE_FULL;
+        }
+    }
+    taskEXIT_CRITICAL_FROM_ISR( uxSavedInterruptStatus );
+
+    traceRETURN_xQueueGenericSendFromISR( xReturn );
+
+    return xReturn;
+}
+```
+
+**解析：**
+
+- **Queue 已滿**：因為 ISR 絕不能 Block，立即觸發 `traceQUEUE_SEND_FAILED` 巨集，並設定 `xReturn = errQUEUE_FULL`。
+    
+- **`taskEXIT_CRITICAL_FROM_ISR(uxSavedInterruptStatus)`**：還原中斷屏蔽狀態，恢復原本的中斷響應。
+    
+- **`traceRETURN_...`** 與 **`return xReturn`**：記錄結束 Trace，並回傳 `pdPASS` 或 `errQUEUE_FULL`。
+
+`xQueueGenericSendFromISR` 展示了 FreeRTOS 對中斷安全與即時性的極致考量。它藉由 `cTxLock` 將複雜的雙向鏈結串列修改延後至 Task 層級執行，並利用 `pxHigherPriorityTaskWoken` 確保上下文切換只在 ISR 完全結束前統一發動，從而保證中斷服務程式的高效與安全。
+
+### 17. *xQueueGiveFromISR*
+
+`xQueueGiveFromISR` 是 FreeRTOS 中專門用於在中斷服務程式（ISR）中釋放信號量（Semaphore Give）的核心 API。
+
+雖然它的內部骨架與 `xQueueGenericSendFromISR` 非常相似，但它是針對**項目大小為 0（`uxItemSize == 0`）的佇列**（即二元信號量 Binary Semaphore 與計數信號量 Counting Semaphore）進行的極簡優化版本。它不需要複製任何實際資料，僅需操作計數器即可完成釋放。
+
+#### 17.1 函數簽名與變數初始化
+
+```C
+BaseType_t xQueueGiveFromISR( QueueHandle_t xQueue,
+                              BaseType_t * const pxHigherPriorityTaskWoken )
+{
+    BaseType_t xReturn;
+    UBaseType_t uxSavedInterruptStatus;
+    Queue_t * const pxQueue = xQueue;
+
+    traceENTER_xQueueGiveFromISR( xQueue, pxHigherPriorityTaskWoken );
+```
+
+**解析：**
+
+- **`xQueue`**：待釋放的信號量（Semaphore）句柄。在 FreeRTOS 內部，Semaphore 本質上就是 Queue。
+    
+- **`pxHigherPriorityTaskWoken`**：輸出指標。若此次釋放動作喚醒了一個優先級高於當前被打斷 Task 的任務，此指標指向的值會被改寫為 `pdTRUE`。
+    
+- **`uxSavedInterruptStatus`**：保存進入中斷臨界區前，硬體暫存器裡的中斷狀態。
+    
+- **`traceENTER_xQueueGiveFromISR(...)`**：追蹤（Trace）工具的進入點記錄巨集。
+
+#### 17.2 安全性與機制限制斷言 (configASSERT)
+
+```C
+configASSERT( ( pxQueue != NULL ) && ( pxQueue->uxItemSize == 0 ) );
+
+    configASSERT( ( pxQueue != NULL ) && !( ( pxQueue->uxQueueType == queueQUEUE_IS_MUTEX ) && ( pxQueue->u.xSemaphore.xMutexHolder != NULL ) ) );
+
+    portASSERT_IF_INTERRUPT_PRIORITY_INVALID();
+```
+
+**解析：**
+
+- **`pxQueue->uxItemSize == 0`**：**第一個關鍵斷言！** 確保此 API 只能用於 Semaphore（因為 Semaphore 每個項目大小為 0，不需要寫入實體數據）。如果項目大小大於 0，必須改呼叫 `xQueueGenericSendFromISR()`。
+    
+- **Mutex 與中斷限制斷言**：
+    
+    - 互斥鎖（Mutex）帶有「優先級繼承（Priority Inheritance）」機制。
+        
+    - 優先級繼承是 Task 專有的概念（中斷沒有優先級繼承）。因此，**禁止在中斷（ISR）中釋放一個已經被 Task 持有的 Mutex**。若觸發此條件，防呆斷言會直接報錯。
+        
+- **`portASSERT_IF_INTERRUPT_PRIORITY_INVALID()`**：檢查觸發此中斷的 NVIC 優先級是否高於 `configMAX_SYSCALL_INTERRUPT_PRIORITY`。如果是，則禁止呼叫 FreeRTOS API 以維護核心數據安全。
+
+#### 17.3 進入臨界區與信號量計數加一 (Counting)
+
+```C
+uxSavedInterruptStatus = ( UBaseType_t ) taskENTER_CRITICAL_FROM_ISR();
+    {
+        const UBaseType_t uxMessagesWaiting = pxQueue->uxMessagesWaiting;
+
+        if( uxMessagesWaiting < pxQueue->uxLength )
+        {
+            const int8_t cTxLock = pxQueue->cTxLock;
+
+            traceQUEUE_SEND_FROM_ISR( pxQueue );
+
+            pxQueue->uxMessagesWaiting = ( UBaseType_t ) ( uxMessagesWaiting + ( UBaseType_t ) 1 );
+```
+
+**解析：**
+
+- **`taskENTER_CRITICAL_FROM_ISR()`**：屏蔽 `configMAX_SYSCALL_INTERRUPT_PRIORITY` 以下的中斷，確保後續讀寫操作為原子操作（Atomic）。
+    
+- **`if( uxMessagesWaiting < pxQueue->uxLength )`**：檢查信號量是否還有釋放空間（例如 Binary Semaphore 的最大容量 `uxLength = 1`，Counting Semaphore 則是建立時設定的最大值）。
+    
+- **`uxMessagesWaiting` 直接加一**：對比 `xQueueGenericSendFromISR` 呼叫了 `prvCopyDataToQueue`，這裡直接將計數值加 1。因為 Semaphore 沒有實際資料需要 memcpy，執行效能極高。
+
+#### 17.4 當 Queue 未被鎖定 (`cTxLock == queueUNLOCKED`) 且開啟 Queue Sets (`configUSE_QUEUE_SETS == 1`)
+
+```C
+if( cTxLock == queueUNLOCKED )
+            {
+                #if ( configUSE_QUEUE_SETS == 1 )
+                {
+                    if( pxQueue->pxQueueSetContainer != NULL )
+                    {
+                        if( prvNotifyQueueSetContainer( pxQueue ) != pdFALSE )
+                        {
+                            if( pxHigherPriorityTaskWoken != NULL )
+                            {
+                                *pxHigherPriorityTaskWoken = pdTRUE;
+                            }
+                            else
+                            {
+                                mtCOVERAGE_TEST_MARKER();
+                            }
+                        }
+                        else
+                        {
+                            mtCOVERAGE_TEST_MARKER();
+                        }
+                    }
+                    else
+                    {
+                        if( listLIST_IS_EMPTY( &( pxQueue->xTasksWaitingToReceive ) ) == pdFALSE )
+                        {
+                            if( xTaskRemoveFromEventList( &( pxQueue->xTasksWaitingToReceive ) ) != pdFALSE )
+                            {
+                                if( pxHigherPriorityTaskWoken != NULL )
+                                {
+                                    *pxHigherPriorityTaskWoken = pdTRUE;
+                                }
+                                else
+                                {
+                                    mtCOVERAGE_TEST_MARKER();
+                                }
+                            }
+                            else
+                            {
+                                mtCOVERAGE_TEST_MARKER();
+                            }
+                        }
+                        else
+                        {
+                            mtCOVERAGE_TEST_MARKER();
+                        }
+                    }
+                }
+```
+
+**解析：**
+
+- **`cTxLock == queueUNLOCKED`**：代表當前沒有任何 Task 鎖定此 Queue。
+    
+- **`pxQueueSetContainer != NULL`（隸屬 Queue Set）**：
+    
+    - 呼叫 `prvNotifyQueueSetContainer(pxQueue)`，將 Semaphore 的句柄寫入 Queue Set。
+        
+    - 若此動作成功解鎖了一個等待該 Queue Set 的高優先級 Task，且傳入的 `pxHigherPriorityTaskWoken != NULL`，將 `*pxHigherPriorityTaskWoken` 設為 **`pdTRUE`**。
+        
+- **`pxQueueSetContainer == NULL`（不隸屬 Queue Set）**：
+    
+    - 檢查是否有 Task 正在等待此 Semaphore (`xTasksWaitingToReceive` 非空)。
+        
+    - 呼叫 `xTaskRemoveFromEventList` 將最高優先級的等待 Task 移至 Ready List。若被喚醒的 Task 優先級高於當前被打斷的 Task，且指標非空，將 `*pxHigherPriorityTaskWoken` 設為 **`pdTRUE`**。
+
+#### 17.5 當 Queue 未被鎖定 (`cTxLock == queueUNLOCKED`) 且關閉 Queue Sets (`configUSE_QUEUE_SETS == 0`)
+
+```C
+#else /* configUSE_QUEUE_SETS */
+                {
+                    if( listLIST_IS_EMPTY( &( pxQueue->xTasksWaitingToReceive ) ) == pdFALSE )
+                    {
+                        if( xTaskRemoveFromEventList( &( pxQueue->xTasksWaitingToReceive ) ) != pdFALSE )
+                        {
+                            if( pxHigherPriorityTaskWoken != NULL )
+                            {
+                                *pxHigherPriorityTaskWoken = pdTRUE;
+                            }
+                            else
+                            {
+                                mtCOVERAGE_TEST_MARKER();
+                            }
+                        }
+                        else
+                        {
+                            mtCOVERAGE_TEST_MARKER();
+                        }
+                    }
+                    else
+                    {
+                        mtCOVERAGE_TEST_MARKER();
+                    }
+                }
+                #endif /* configUSE_QUEUE_SETS */
+            }
+```
+
+**解析：**
+
+- **未啟用 Queue Sets 時的處理**：
+    
+    - 判斷 `xTasksWaitingToReceive` 串列是否非空。
+        
+    - **非空**：呼叫 `xTaskRemoveFromEventList` 將等待最高優先級 Task 喚醒。若被喚醒 Task 的優先級高於當前 Task，且 `pxHigherPriorityTaskWoken != NULL`，則寫入 `*pxHigherPriorityTaskWoken = pdTRUE`。
+        
+    - **為空**：無 Task 等待此 Semaphore，執行測試覆蓋標記 `mtCOVERAGE_TEST_MARKER()`。
+
+#### 17.6 當 Queue 處於鎖定狀態 (`cTxLock != queueUNLOCKED`)
+
+```C
+else
+            {
+                prvIncrementQueueTxLock( pxQueue, cTxLock );
+            }
+
+            xReturn = pdPASS;
+        }
+```
+
+**解析：**
+
+- **`cTxLock != queueUNLOCKED`**：代表有 Task 正在存取這個 Semaphore 且暫停了排程（透過 `prvLockQueue()` 鎖定了 Queue）。
+    
+- **延後處理（Deferred Handling）**：為了避免與 Task 發生競態條件，ISR 不能直接去修改 `xTasksWaitingToReceive` 事件清單。
+    
+- **鎖定計數累加**：ISR 只呼叫 `prvIncrementQueueTxLock` 將 `cTxLock` 加 1。等該 Task 解鎖 (`prvUnlockQueue()`) 時，會發現 `cTxLock` 變大了，屆時由 Task 補做喚醒操作。
+    
+- 標記操作成功 `xReturn = pdPASS`。
+
+#### 17.7 信號量已滿處理、退出臨界區與回傳
+
+```C
+else
+        {
+            traceQUEUE_SEND_FROM_ISR_FAILED( pxQueue );
+            xReturn = errQUEUE_FULL;
+        }
+    }
+    taskEXIT_CRITICAL_FROM_ISR( uxSavedInterruptStatus );
+
+    traceRETURN_xQueueGiveFromISR( xReturn );
+
+    return xReturn;
+}
+```
+
+**解析：**
+
+- **信號量已滿 (`uxMessagesWaiting >= uxLength`)**：
+    
+    - 例如：Binary Semaphore 已經為 1，在中斷裡又呼叫一次 Give。
+        
+    - 觸發 `traceQUEUE_SEND_FROM_ISR_FAILED` 追蹤巨集，並設定 `xReturn = errQUEUE_FULL`（中斷 API 絕不等待）。
+        
+- **`taskEXIT_CRITICAL_FROM_ISR(uxSavedInterruptStatus)`**：離開臨界區，還原進入前的硬體中斷狀態。
+    
+- 最終回傳 `pdPASS` 或 `errQUEUE_FULL`。
+
+#### 17.8 `xQueueGiveFromISR` 與 `xQueueGenericSendFromISR` 的核心對比
+
+|**比較項目**|**xQueueGiveFromISR**|**xQueueGenericSendFromISR**|
+|---|---|---|
+|**主要用途**|**信號量釋放** (Binary / Counting Semaphore)|**通用佇列發送** (Queue Data Send)|
+|**項目大小限制**|**強制 `uxItemSize == 0`**（否則 Assert 失敗）|支援 `uxItemSize > 0`|
+|**記憶體複製**|**不需要**（僅需要對 `uxMessagesWaiting` 加一）|需要呼叫 `prvCopyDataToQueue()` 進行 memcpy|
+|**覆寫模式**|不支援（因為信號量不需要 Cover Write）|支援 (`queueOVERWRITE`)|
+|**Mutex 限制**|若 Mutex 已經被 Task 持有，**禁止呼叫**|不適用（通用 Queue 無 MutexHolder 屬性）|
+### 18. *xQueueReceive*
+
+`xQueueReceive` 是 FreeRTOS 中用於從佇列（Queue）、二元信號量（Binary Semaphore）或計數信號量（Counting Semaphore）**讀取項目**的核心任務層級 API。
+
+與 ISR 版本（`FromISR`）不同，`xQueueReceive` 允許當佇列為空時，將呼叫此 API 的 Task 放入**阻塞狀態（Blocked State）**，並指定最長等待時間（`xTicksToWait`）。它採用了雙重保護機制（臨界區 + 暫停排程器/鎖定佇列）來保證任務狀態轉移的原子性。
+
+#### 18.1 函數簽名、變數初始化與安全斷言 (configASSERT)
+
+```C
+BaseType_t xQueueReceive( QueueHandle_t xQueue,
+                          void * const pvBuffer,
+                          TickType_t xTicksToWait )
+{
+    BaseType_t xEntryTimeSet = pdFALSE;
+    TimeOut_t xTimeOut;
+    Queue_t * const pxQueue = xQueue;
+
+    traceENTER_xQueueReceive( xQueue, pvBuffer, xTicksToWait );
+
+    /* Check the pointer is not NULL. */
+    configASSERT( ( pxQueue ) );
+
+    /* The buffer into which data is received can only be NULL if the data size
+     * is zero (so no data is copied into the buffer). */
+    configASSERT( !( ( ( pvBuffer ) == NULL ) && ( ( pxQueue )->uxItemSize != ( UBaseType_t ) 0U ) ) );
+
+    /* Cannot block if the scheduler is suspended. */
+    #if ( ( INCLUDE_xTaskGetSchedulerState == 1 ) || ( configUSE_TIMERS == 1 ) )
+    {
+        configASSERT( !( ( xTaskGetSchedulerState() == taskSCHEDULER_SUSPENDED ) && ( xTicksToWait != 0 ) ) );
+    }
+    #endif
+```
+
+**解析：**
+
+- **`xEntryTimeSet` / `xTimeOut`**：用於記錄 Task 開始等待的時間點。當 Task 被中途喚醒但 Tick 尚未逾期時，能精準計算殘餘的等待時間。
+    
+- **`configASSERT( ( pxQueue ) )`**：防呆檢查，佇列控制結構指針不得為 `NULL`。
+    
+- **`pvBuffer` 指針斷言**：只有當 `uxItemSize == 0`（即信號量 Semaphore）時，`pvBuffer` 才允許為 `NULL`；若 Queue 存有資料實體（`uxItemSize > 0`），則 `pvBuffer` 不得為 `NULL`。
+    
+- **排程器暫停斷言**：若排程器處於暫停狀態（`taskSCHEDULER_SUSPENDED`），系統無法進行任務切換，此時**絕對禁止設置等待時間（`xTicksToWait != 0`）**。
+
+#### 18.2 臨界區內判斷：佇列有資料時的讀取流程 (`uxMessagesWaiting > 0`)
+
+```C
+for( ; ; )
+    {
+        taskENTER_CRITICAL();
+        {
+            const UBaseType_t uxMessagesWaiting = pxQueue->uxMessagesWaiting;
+
+            /* Is there data in the queue now?  To be running the calling task
+             * must be the highest priority task wanting to access the queue. */
+            if( uxMessagesWaiting > ( UBaseType_t ) 0 )
+            {
+                /* Data available, remove one item. */
+                prvCopyDataFromQueue( pxQueue, pvBuffer );
+                traceQUEUE_RECEIVE( pxQueue );
+                pxQueue->uxMessagesWaiting = ( UBaseType_t ) ( uxMessagesWaiting - ( UBaseType_t ) 1 );
+
+                /* There is now space in the queue, were any tasks waiting to
+                 * post to the queue?  If so, unblock the highest priority waiting
+                 * task. */
+                if( listLIST_IS_EMPTY( &( pxQueue->xTasksWaitingToSend ) ) == pdFALSE )
+                {
+                    if( xTaskRemoveFromEventList( &( pxQueue->xTasksWaitingToSend ) ) != pdFALSE )
+                    {
+                        queueYIELD_IF_USING_PREEMPTION();
+                    }
+                    else
+                    {
+                        mtCOVERAGE_TEST_MARKER();
+                    }
+                }
+                else
+                {
+                    mtCOVERAGE_TEST_MARKER();
+                }
+
+                taskEXIT_CRITICAL();
+
+                traceRETURN_xQueueReceive( pdPASS );
+
+                return pdPASS;
+            }
+```
+
+**解析：**
+
+- **`taskENTER_CRITICAL()`**：進入任務臨界區，關閉中斷，確保讀取佇列狀態與資料時不被其他 Task 或 ISR 打擾。
+    
+- **`prvCopyDataFromQueue(...)`**：從 Queue 的頭部（`u.xQueue.pcReadFrom`）複製一份項目資料至 `pvBuffer`。
+    
+- **更新訊息計數**：`uxMessagesWaiting` 減 1，此時 Queue 空出了一個位置。
+    
+- **喚醒等待發送的 Task**：
+    
+    - 檢查是否有其他 Task 因為之前 Queue 滿了而阻塞在 `xTasksWaitingToSend` 串列中。
+        
+    - 若有，呼叫 `xTaskRemoveFromEventList` 將最高優先級的等待 Task 移至 Ready List。
+        
+    - 若被喚醒的 Task 優先級高於當前 Task，呼叫 `queueYIELD_IF_USING_PREEMPTION()` 發動搶占式任務切換。
+        
+- 離開臨界區並回傳 **`pdPASS`**，成功讀取資料。
+
+#### 18.3 臨界區內判斷：佇列為空時的超時與時間記錄 (`uxMessagesWaiting == 0`)
+
+```C
+else
+            {
+                if( xTicksToWait == ( TickType_t ) 0 )
+                {
+                    /* The queue was empty and no block time is specified (or
+                     * the block time has expired) so leave now. */
+                    taskEXIT_CRITICAL();
+
+                    traceQUEUE_RECEIVE_FAILED( pxQueue );
+                    traceRETURN_xQueueReceive( errQUEUE_EMPTY );
+
+                    return errQUEUE_EMPTY;
+                }
+                else if( xEntryTimeSet == pdFALSE )
+                {
+                    /* The queue was empty and a block time was specified so
+                     * configure the timeout structure. */
+                    vTaskInternalSetTimeOutState( &xTimeOut );
+                    xEntryTimeSet = pdTRUE;
+                }
+                else
+                {
+                    /* Entry time was already set. */
+                    mtCOVERAGE_TEST_MARKER();
+                }
+            }
+        }
+        taskEXIT_CRITICAL();
+```
+
+**解析：**
+
+- **當 `xTicksToWait == 0`**：代表使用者不打算等待。既然目前佇列無資料，直接離開臨界區並回傳 **`errQUEUE_EMPTY`**。
+    
+- **當 `xTicksToWait > 0` 且首次進入 (`xEntryTimeSet == pdFALSE`)**：
+    
+    - 呼叫 `vTaskInternalSetTimeOutState(&xTimeOut)` 記錄目前的 SysTick 時間點。
+        
+    - 將 `xEntryTimeSet` 設為 `pdTRUE`，後續重入 `for(;;)` 迴圈時就不會重複初始化此時間點。
+        
+- **離開臨界區**：釋放 CPU 臨界區，準備進行更深度的 Task 阻塞流程。
+
+#### 18.4 暫停排程器與鎖定佇列（準備變更任務狀態）
+
+```C
+/* Interrupts and other tasks can send to and receive from the queue
+         * now the critical section has been exited. */
+
+        vTaskSuspendAll();
+        prvLockQueue( pxQueue );
+```
+
+**解析：**
+
+- **`vTaskSuspendAll()`**：暫停 RTOS 排程器，防止其他 Task 搶占當前 Task。
+    
+- **`prvLockQueue(pxQueue)`**：鎖定當前 Queue（將 `cRxLock` 與 `cTxLock` 設為非 0 值）。
+    
+- **為什麼需要鎖定？**
+    
+    - 在將 Task 加入 `xTasksWaitingToReceive` 鏈結串列時，中斷（ISR）依然隨時可能發生。
+        
+    - 鎖定 Queue 後，若 ISR 此時寫入資料，ISR 會發現 Queue 被鎖，進而只會累加 `cTxLock`，而**不會去修改 `xTasksWaitingToReceive` 事件串列**，從而避免資料競爭（Data Race）。
+
+#### 18.5 檢查超時與將 Task 放入等待串列（進入 Blocked 狀態）
+
+```C
+/* Update the timeout state to see if it has expired yet. */
+        if( xTaskCheckForTimeOut( &xTimeOut, &xTicksToWait ) == pdFALSE )
+        {
+            /* The timeout has not expired.  If the queue is still empty place
+             * the task on the list of tasks waiting to receive from the queue. */
+            if( prvIsQueueEmpty( pxQueue ) != pdFALSE )
+            {
+                traceBLOCKING_ON_QUEUE_RECEIVE( pxQueue );
+                vTaskPlaceOnEventList( &( pxQueue->xTasksWaitingToReceive ), xTicksToWait );
+                prvUnlockQueue( pxQueue );
+
+                if( xTaskResumeAll() == pdFALSE )
+                {
+                    taskYIELD_WITHIN_API();
+                }
+                else
+                {
+                    mtCOVERAGE_TEST_MARKER();
+                }
+            }
+            else
+            {
+                /* The queue contains data again.  Loop back to try and read the
+                 * data. */
+                prvUnlockQueue( pxQueue );
+                ( void ) xTaskResumeAll();
+            }
+        }
+```
+
+**解析：**
+
+- **`xTaskCheckForTimeOut()`**：計算時間差並更新 `xTicksToWait` 的剩餘值。若未超時回傳 `pdFALSE`。
+    
+- **`prvIsQueueEmpty(pxQueue)` 二次確認**：
+    
+    - 再次確認 Queue 是否真的為空（因為在解鎖臨界區到鎖定 Queue 的縫隙間，可能有 ISR 寫入了資料）。
+        
+    - **若依然為空**：呼叫 `vTaskPlaceOnEventList` 將 Task 同時放入 Queue 的 `xTasksWaitingToReceive` 列表與系統 Delayed Task 列表（開始倒數等待）。
+        
+    - 解鎖 Queue (`prvUnlockQueue`) 並恢復排程器 (`xTaskResumeAll`)。若 `xTaskResumeAll` 回傳 `pdFALSE`，呼叫 `taskYIELD_WITHIN_API()` **正式讓出 CPU， Task 進入 Blocked 狀態**。
+        
+    - **若縫隙間有資料進來（不為空）**：不阻塞 Task，直接解鎖 Queue 與恢復排程器，進入下一輪 `for(;;)` 迴圈嘗試讀取資料。
+
+#### 18.6 超時處理（Timeout Expired）與退出機制
+
+```C
+else
+        {
+            /* Timed out.  If there is no data in the queue exit, otherwise loop
+             * back and attempt to read the data. */
+            prvUnlockQueue( pxQueue );
+            ( void ) xTaskResumeAll();
+
+            if( prvIsQueueEmpty( pxQueue ) != pdFALSE )
+            {
+                traceQUEUE_RECEIVE_FAILED( pxQueue );
+                traceRETURN_xQueueReceive( errQUEUE_EMPTY );
+
+                return errQUEUE_EMPTY;
+            }
+            else
+            {
+                mtCOVERAGE_TEST_MARKER();
+            }
+        }
+    }
+}
+```
+
+**解析：**
+
+- **`xTaskCheckForTimeOut()` 回傳 `pdTRUE`（已超時）**：
+    
+    - 先解鎖 Queue (`prvUnlockQueue`) 並恢復排程器 (`xTaskResumeAll`)。
+        
+    - **`prvIsQueueEmpty()` 最後檢查**：檢查在超時瞬間是否有資料恰好被寫入 Queue。
+        
+    - **若依然為空**：確實超時，觸發 Trace 失敗巨集並回傳 **`errQUEUE_EMPTY`**。
+        
+    - **若剛好有資料**：執行 `mtCOVERAGE_TEST_MARKER()`，重新回到 `for(;;)` 頂端將該筆資料讀出，確保資料不被遺漏。
+
+### 19. *xQueueSemaphoreTake*
+
